@@ -1,0 +1,85 @@
+platform	depth	ordering	metric	lr_regime	seed	val_bpb	steps	description
+# ============================================================
+# CUDA — RTX 2060 6GB, torch.compile, fp32
+# Source: autoresearch ADR-003 v2, token diversity metric
+# ============================================================
+cuda	4	sequential	token_diversity	standard_wd	42	1.719066	124	curriculum: sequential (no buffer)
+cuda	4	buffered_passthrough	token_diversity	standard_wd	42	1.680013	86	curriculum: buffered passthrough
+cuda	4	random	token_diversity	standard_wd	42	1.613521	98	curriculum: random shuffle
+cuda	4	easy_to_hard	token_diversity	standard_wd	42	1.631933	95	curriculum: easy to hard
+cuda	4	hard_to_easy	token_diversity	standard_wd	42	1.627136	97	curriculum: hard to easy
+cuda	4	shao_yong	token_diversity	standard_wd	42	1.637931	93	curriculum: shao yong
+cuda	4	king_wen	token_diversity	standard_wd	42	1.661734	89	curriculum: king wen
+# ============================================================
+# CUDA — Compression ratio rerun (ADR-006a)
+# ============================================================
+cuda	4	sequential	compression_ratio	standard_wd	42	1.777541	100	curriculum-cr: sequential
+cuda	4	buffered_passthrough	compression_ratio	standard_wd	42	1.640138	96	curriculum-cr: buffered passthrough
+cuda	4	random	compression_ratio	standard_wd	42	1.626627	96	curriculum-cr: random shuffle
+cuda	4	easy_to_hard	compression_ratio	standard_wd	42	1.633691	95	curriculum-cr: easy to hard
+cuda	4	hard_to_easy	compression_ratio	standard_wd	42	1.633596	95	curriculum-cr: hard to easy
+cuda	4	king_wen	compression_ratio	standard_wd	42	1.638436	95	curriculum-cr: king wen
+# ============================================================
+# CUDA — V1 buffer bug (GPU tensor cloning, ADR-003 v1)
+# ============================================================
+cuda	4	sequential	token_diversity	standard_wd	42	1.719	124	v1-bug: sequential (no buffer)
+cuda	4	buffered_passthrough_v1	token_diversity	standard_wd	42	2.794	109	v1-bug: passthrough (GPU cloned tensors)
+cuda	4	random_v1	token_diversity	standard_wd	42	2.849	114	v1-bug: random (GPU cloned tensors)
+cuda	4	easy_to_hard_v1	token_diversity	standard_wd	42	2.839	116	v1-bug: easy to hard (GPU cloned tensors)
+cuda	4	hard_to_easy_v1	token_diversity	standard_wd	42	2.814	113	v1-bug: hard to easy (GPU cloned tensors)
+# ============================================================
+# CUDA — UCB1 adaptive curriculum (ADR-007)
+# ============================================================
+cuda	4	sequential	token_diversity	standard_wd	42	1.967922	46	ADR-007: sequential
+cuda	4	random	token_diversity	standard_wd	42	1.870227	45	ADR-007: random shuffle
+cuda	4	adaptive_ucb1	token_diversity	standard_wd	42	1.863205	45	ADR-007: adaptive UCB1
+# ============================================================
+# CUDA — King Wen LR modulation (ADR-002)
+# ============================================================
+cuda	4	baseline	none	standard_wd	42	1.753376		LR: baseline standard
+cuda	4	random_perturbation	none	standard_wd	42	1.730856		LR: random perturbation amp=0.3
+cuda	4	shao_yong_lr	none	standard_wd	42	1.732407		LR: shao yong amp=0.3
+cuda	4	king_wen_lr_0.3	none	standard_wd	42	1.785356		LR: king wen amp=0.3
+cuda	4	king_wen_lr_0.15	none	standard_wd	42	1.777449		LR: king wen amp=0.15
+cuda	4	king_wen_lr_0.5	none	standard_wd	42	1.789786		LR: king wen amp=0.5
+# ============================================================
+# MLX — MacBook Pro 96GB, no compilation, fp32
+# Source: autoresearch-mlx ADR-006
+# ============================================================
+# Phase 1 baselines
+mlx	4	baseline	none	standard_wd	42	1.773	337	Phase 1: DEPTH=4 baseline
+mlx	6	baseline	none	standard_wd	42	2.139	131	Phase 1: DEPTH=6 baseline
+mlx	8	baseline	none	standard_wd	42	2.368	81	Phase 1: DEPTH=8 baseline
+mlx	12	baseline	none	standard_wd	42	2.773	6	Phase 1: DEPTH=12 baseline
+# Noise floor seeds
+mlx	4	baseline	none	standard_wd	7	1.713		Phase 1: DEPTH=4 seed 7
+mlx	4	baseline	none	standard_wd	123	1.754		Phase 1: DEPTH=4 seed 123
+mlx	6	baseline	none	standard_wd	7	2.118		Phase 1: DEPTH=6 seed 7
+mlx	6	baseline	none	standard_wd	123	2.161		Phase 1: DEPTH=6 seed 123
+# Buffer validation
+mlx	4	buffered_passthrough	compression_ratio	standard_wd	42	1.735		Phase 1: buffer passthrough
+# Phase 2 — DEPTH=4, compression ratio
+mlx	4	sequential	compression_ratio	standard_wd	42	1.732		Phase 2: D4 std WD
+mlx	4	random	compression_ratio	standard_wd	42	1.713		Phase 2: D4 std WD
+mlx	4	easy_to_hard	compression_ratio	standard_wd	42	1.695		Phase 2: D4 std WD
+mlx	4	hard_to_easy	compression_ratio	standard_wd	42	1.709		Phase 2: D4 std WD
+mlx	4	king_wen	compression_ratio	standard_wd	42	1.724		Phase 2: D4 std WD
+mlx	4	sequential	compression_ratio	constant_lr	42	1.722		Phase 2: D4 const LR
+mlx	4	random	compression_ratio	constant_lr	42	1.697		Phase 2: D4 const LR
+mlx	4	easy_to_hard	compression_ratio	constant_lr	42	1.731		Phase 2: D4 const LR
+mlx	4	hard_to_easy	compression_ratio	constant_lr	42	1.707		Phase 2: D4 const LR
+mlx	4	king_wen	compression_ratio	constant_lr	42	1.729		Phase 2: D4 const LR
+# Phase 2 — DEPTH=6, compression ratio
+mlx	6	sequential	compression_ratio	standard_wd	42	2.056		Phase 2: D6 std WD
+mlx	6	random	compression_ratio	standard_wd	42	2.047		Phase 2: D6 std WD
+mlx	6	easy_to_hard	compression_ratio	standard_wd	42	2.099		Phase 2: D6 std WD
+mlx	6	hard_to_easy	compression_ratio	standard_wd	42	2.084		Phase 2: D6 std WD
+mlx	6	king_wen	compression_ratio	standard_wd	42	2.074		Phase 2: D6 std WD
+mlx	6	sequential	compression_ratio	constant_lr	42	2.039		Phase 2: D6 const LR
+mlx	6	random	compression_ratio	constant_lr	42	2.056		Phase 2: D6 const LR
+mlx	6	easy_to_hard	compression_ratio	constant_lr	42	2.079		Phase 2: D6 const LR
+mlx	6	hard_to_easy	compression_ratio	constant_lr	42	2.095		Phase 2: D6 const LR
+mlx	6	king_wen	compression_ratio	constant_lr	42	2.030		Phase 2: D6 const LR
+# Token diversity check
+mlx	4	sequential	token_diversity	standard_wd	42	1.663	345	Token div check
+mlx	4	random	token_diversity	standard_wd	42	1.673	345	Token div check

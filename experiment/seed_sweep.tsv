@@ -1,0 +1,18 @@
+seed	val_bpb	platform	depth	description
+# 30-seed sweep, CUDA DEPTH=4, RTX 2060, 5-min budget
+# Source: autoresearch ADR-004
+# Summary: mean=1.7560, std=0.0089, CV=0.51%, range=0.0415
+# Best: seed 28 (1.7317), Worst: seed 6 (1.7732)
+# Noise floor adopted: +-0.040 bpb
+28	1.7317	cuda	4	best seed
+0	1.7560	cuda	4	near mean (placeholder — individual values in autoresearch repo)
+6	1.7732	cuda	4	worst seed
+# MLX noise floor (3-seed sweep)
+# DEPTH=4: range 0.060, std 0.030
+42	1.773	mlx	4	DEPTH=4 seed 42
+7	1.713	mlx	4	DEPTH=4 seed 7
+123	1.754	mlx	4	DEPTH=4 seed 123
+# DEPTH=6: range 0.043, std 0.021
+42	2.139	mlx	6	DEPTH=6 seed 42
+7	2.118	mlx	6	DEPTH=6 seed 7
+123	2.161	mlx	6	DEPTH=6 seed 123
