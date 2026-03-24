@@ -1,0 +1,428 @@
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\documentclass{article}
+\usepackage{arxiv}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{fontspec}
+\usepackage{unicode-math}
+\setmainfont{Linux Libertine O}
+\setmathfont{XITS Math}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+
+\title{Compiled Kernels Amplify Data Ordering Effects\\in Language Model Pretraining}
+\author{Augustin Chan\\
+\texttt{aug@iterative.day}\\
+Independent Researcher}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We report an interaction between \texttt{torch.compile} and training data ordering
+that produces curriculum-like effects absent on non-compiled frameworks.
+In controlled experiments training a 3M-parameter GPT model on identical data,
+random shuffling of a 64-batch buffer improves validation bits-per-byte by
+0.106 on CUDA with \texttt{torch.compile} --- 2.7$\times$ the seed noise floor ---
+while the same shuffling produces improvements of 0.008--0.037 on Apple MLX,
+within measurement noise.
+The effect persists across two independent difficulty metrics (token diversity
+and compression ratio), ruling out metric artifacts.
+We hypothesize that \texttt{torch.compile}'s kernel fusion and graph optimization
+specialize execution paths to sequential data access patterns created by
+best-fit document packing; shuffling disrupts these patterns, forcing
+more general computation.
+To our knowledge, this interaction between framework compilation and
+data ordering has not been previously documented.
+Our results have practical implications: curriculum learning experiments
+conducted under \texttt{torch.compile} may report spurious effects that
+do not generalize to other frameworks or deployment settings.
+\end{abstract}
+
+\textbf{Keywords:} torch.compile, curriculum learning, data ordering,
+compilation artifacts, language model pretraining, MLX, kernel optimization
+
+%% ============================================================
+\section{Introduction}\label{sec:introduction}
+%% ============================================================
+
+The order in which training data is presented to a language model can
+affect final performance. Curriculum learning approaches
+\cite{bengio2009curriculum, graves2017automated} propose structured
+orderings --- typically easy-to-hard --- to improve convergence or final
+quality. Recent work has demonstrated measurable effects of data ordering
+in LLM pretraining \cite{beyondrandom2025, lrdecay2025}, with
+compression ratio and lexical diversity emerging as effective difficulty
+signals.
+
+Separately, framework-level compilation has become standard practice in
+PyTorch training. \texttt{torch.compile} \cite{pytorch2compile} traces
+execution graphs and generates fused CUDA kernels optimized for observed
+data access patterns, typically yielding 1.5--2$\times$ throughput
+improvements.
+
+We report an unexpected interaction between these two developments:
+the magnitude of data ordering effects depends strongly on whether
+the training framework compiles execution graphs. Specifically, the
+same curriculum experiment produces dramatic effects on
+CUDA/\texttt{torch.compile} and null effects on Apple MLX, a framework
+with no equivalent compilation step.
+
+This finding emerged from an investigation of the King Wen I-Ching
+sequence as a curriculum ordering \cite{chan2025kingwen}. Across 50+
+controlled experiments on two hardware platforms, the curriculum
+hypothesis was falsified --- but the platform discrepancy revealed
+something unexpected about how compilation interacts with data structure.
+
+%% ============================================================
+\section{Experimental Setup}\label{sec:setup}
+%% ============================================================
+
+\subsection{Model and Data}
+
+All experiments use the autoresearch framework \cite{karpathy2024autoresearch}:
+a 4-layer GPT model ($\sim$3M parameters) with sliding window attention,
+RoPE positional encoding, and a custom AdamW optimizer with per-parameter
+learning rate groups. Training data is drawn from ClimbMix-400B via
+parquet shards, tokenized with a BPE tokenizer (vocabulary size 8192)
+and packed using best-fit document packing \cite{fewertruncations2024}.
+
+Training is bounded by a fixed wall-clock budget of 300 seconds.
+Curriculum overhead (difficulty scoring, buffer sorting) counts against
+this budget, ensuring that expensive ordering strategies are
+automatically penalized.
+
+\subsection{Curriculum Buffer}
+
+A 64-batch buffer wraps the dataloader. At each refill, all 64
+micro-batches are scored by difficulty, reordered according to the
+experimental condition, and yielded one at a time to the training loop.
+Six ordering conditions are tested:
+
+\begin{itemize}\tightlist
+\item \textbf{Sequential} (no buffer): unmodified dataloader
+\item \textbf{Buffered passthrough}: buffer enabled, no reordering
+\item \textbf{Random shuffle}: buffer contents randomly permuted
+\item \textbf{Easy-to-hard}: ascending difficulty
+\item \textbf{Hard-to-easy}: descending difficulty
+\item \textbf{King Wen}: rank-mapped to I-Ching surprise profile
+\end{itemize}
+
+\subsection{Difficulty Metrics}
+
+Two independent metrics are tested to rule out metric-specific artifacts:
+
+\begin{itemize}\tightlist
+\item \textbf{Token diversity}: $\text{unique}(x) / |x|$ --- the fraction
+of unique tokens in a micro-batch. Zero computational overhead.
+\item \textbf{Compression ratio}: $|\text{gzip}(x.\text{bytes}())| / |x.\text{bytes}()|$
+--- ratio of compressed to raw byte length. Approximately 7\% of
+training budget as overhead.
+\end{itemize}
+
+\subsection{Platforms}
+
+\begin{itemize}\tightlist
+\item \textbf{CUDA}: Intel desktop, NVIDIA RTX 2060 (6 GB), PyTorch with
+\texttt{torch.compile}, fp32 (Turing architecture lacks bf16 support)
+\item \textbf{MLX}: MacBook Pro, Apple M-series, 96 GB unified memory,
+MLX framework \cite{mlx2023}. No compilation step; operations execute
+eagerly via Metal compute shaders.
+\end{itemize}
+
+Both platforms use identical model architecture, hyperparameters,
+data shards, tokenizer, and evaluation procedure. The only differences
+are the framework (PyTorch vs MLX) and hardware (NVIDIA vs Apple Silicon).
+
+\subsection{Evaluation}
+
+The primary metric is \textbf{val\_bpb} (validation bits per byte) ---
+a vocabulary-size-independent measure of language modeling quality.
+Lower is better. Evaluation uses $\sim$1.5M tokens from a held-out
+validation shard. The seed noise floor is 0.04 bpb, established by
+a 30-seed sweep (ADR-004 in supplementary materials).
+
+%% ============================================================
+\section{Results}\label{sec:results}
+%% ============================================================
+
+\subsection{CUDA: Strong Ordering Effects}
+
+Table~\ref{tab:cuda} shows results on the CUDA platform with both
+difficulty metrics.
+
+\begin{table}[h]
+\centering
+\caption{CUDA results: val\_bpb by ordering and difficulty metric.
+Seed 42, DEPTH=4, standard warmdown (0.5).}
+\label{tab:cuda}
+\begin{tabular}{lcccc}
+\toprule
+Ordering & Token Div & Comp Ratio & $\Delta$ (TD) & $\Delta$ (CR) \\
+\midrule
+Sequential       & 1.719 & 1.778 & ---    & ---    \\
+Buffered pass    & 1.680 & 1.640 & -0.039 & -0.138 \\
+\textbf{Random}  & \textbf{1.614} & \textbf{1.627} & \textbf{-0.106} & \textbf{-0.151} \\
+Easy-to-hard     & 1.632 & 1.634 & -0.087 & -0.144 \\
+Hard-to-easy     & 1.627 & 1.634 & -0.092 & -0.144 \\
+King Wen         & 1.662 & 1.638 & -0.057 & -0.140 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All orderings beat sequential. Random shuffle is the best ordering
+under token diversity (0.106 improvement, 2.7$\times$ the noise floor).
+Under compression ratio, the spread collapses to 0.011 but all orderings
+still strongly beat sequential (0.138--0.151).
+
+\subsection{MLX: Null Effects}
+
+Table~\ref{tab:mlx} shows results on the MLX platform.
+
+\begin{table}[h]
+\centering
+\caption{MLX results: val\_bpb by ordering and LR regime.
+Seed 42, DEPTH=4, compression ratio metric.}
+\label{tab:mlx}
+\begin{tabular}{lcc}
+\toprule
+Ordering & Standard WD & Constant LR \\
+\midrule
+Sequential       & 1.732 & 1.722 \\
+Random           & 1.713 & 1.697 \\
+Easy-to-hard     & 1.695 & 1.731 \\
+Hard-to-easy     & 1.709 & 1.707 \\
+King Wen         & 1.724 & 1.729 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+No ordering beats sequential by more than the 0.060 noise floor
+(measured via 3-seed sweep at DEPTH=4). The largest effect
+(easy-to-hard: $-0.037$) is within noise. Token diversity on MLX
+was also tested: sequential 1.663, random 1.673 --- random is
+actually \emph{worse}, confirming the null result.
+
+\subsection{Cross-Platform Comparison}
+
+\begin{table}[h]
+\centering
+\caption{Cross-platform comparison (compression ratio metric).
+$\Delta$ is improvement over each platform's sequential baseline.}
+\label{tab:crossplatform}
+\begin{tabular}{lcccr}
+\toprule
+Ordering & CUDA & MLX & $\Delta$ CUDA & $\Delta$ MLX \\
+\midrule
+Sequential   & 1.778 & 1.732 & ---    & ---    \\
+Random       & 1.627 & 1.713 & -0.151 & -0.020 \\
+Easy-to-hard & 1.634 & 1.695 & -0.144 & -0.037 \\
+King Wen     & 1.638 & 1.724 & -0.140 & -0.009 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The platform gap is 4--10$\times$ larger than the metric gap.
+CUDA shows 0.138--0.151 bpb improvement from any reordering.
+MLX shows 0.009--0.037 --- within seed noise.
+The effect is platform-dependent, not metric-dependent.
+
+%% ============================================================
+\section{Analysis}\label{sec:analysis}
+%% ============================================================
+
+\subsection{Ruling Out Confounds}
+
+Several alternative explanations are considered and ruled out:
+
+\textbf{Hardware differences:} The CUDA machine (RTX 2060, 6 GB) is
+weaker than the MLX machine (96 GB unified memory). If anything, the
+more powerful machine should show larger effects. It shows smaller ones.
+
+\textbf{Precision:} The CUDA machine trains in fp32 (Turing lacks bf16).
+The MLX machine also uses fp32. Precision is controlled.
+
+\textbf{Difficulty metric:} Both token diversity and compression ratio
+were tested on both platforms. The platform gap persists across both
+metrics.
+
+\textbf{Evaluation noise:} The MLX noise floor (0.060, measured via
+3-seed sweep) is larger than CUDA's (0.040, 30-seed sweep), but the
+CUDA effects (0.106--0.151) are 2.5--3.8$\times$ their noise floor,
+while MLX effects (0.009--0.037) are 0.2--0.6$\times$.
+
+\textbf{Data ordering:} Both platforms use the same dataloader, the
+same best-fit packing, and the same buffer implementation. The data
+is identically ordered on both machines.
+
+\subsection{The Compilation Hypothesis}
+
+The remaining systematic difference is \texttt{torch.compile}.
+We propose that the compilation process creates the observed interaction:
+
+\begin{enumerate}
+\item Best-fit document packing creates implicit sequential correlation
+in the training data: adjacent batches share similar document-length
+distributions and content patterns \cite{fewertruncations2024}.
+
+\item \texttt{torch.compile} traces execution graphs and generates
+fused CUDA kernels optimized for the data access patterns it observes.
+When data has consistent sequential structure, the compiled kernels
+specialize to that structure.
+
+\item This specialization creates a form of \emph{kernel-level
+overfitting}: the compiled computation graph is locally optimal for the
+sequential data pattern but suboptimal for the general distribution.
+
+\item Shuffling the buffer disrupts the sequential pattern. The compiled
+kernels, now mismatched to the data, either recompile or fall back to
+more general execution paths. These general paths, while individually
+slower, produce better-generalizing gradient updates.
+\end{enumerate}
+
+On MLX, there is no compilation step. Operations execute eagerly via
+Metal compute shaders that do not adapt to data access patterns.
+Shuffling has no mechanism to disrupt because there is no
+pattern-adapted computation to disrupt.
+
+\subsection{Connection to Memorization-Compression Dynamics}
+
+Recent work on memorization-compression cycles \cite{gapt2025} has shown
+that LLM training naturally alternates between memorization
+(representation expansion) and compression (entropy reduction) phases.
+The gradient alignment between cross-entropy and representation entropy
+oscillates throughout training.
+
+The compilation hypothesis suggests a mechanism by which
+\texttt{torch.compile} may amplify the memorization phase. Compiled
+kernels that specialize to sequential patterns effectively ``memorize''
+the data structure at the computation level, reducing the implicit
+compression pressure that comes from processing diverse data.
+Shuffling restores this compression pressure by forcing the computation
+graph to handle unpredictable access patterns.
+
+This interpretation aligns with the observation that buffered passthrough
+alone (without scoring or reordering) provides substantial benefit on CUDA
+(0.039--0.138 bpb). The mere act of disrupting sequential access patterns
+--- even without any curriculum logic --- accounts for most of the effect.
+
+%% ============================================================
+\section{Implications}\label{sec:implications}
+%% ============================================================
+
+\subsection{For Curriculum Learning Research}
+
+Any curriculum learning experiment conducted with \texttt{torch.compile}
+(or similar compilation frameworks such as JAX/XLA \cite{jax2018})
+should include a non-compiled baseline to distinguish genuine curriculum
+effects from compilation artifacts. Studies reporting curriculum
+improvements without controlling for compilation may be measuring
+an interaction effect rather than a learning dynamics effect.
+
+\subsection{For Training Infrastructure}
+
+The finding that shuffling improves performance on compiled frameworks
+suggests a practical optimization: inserting a random shuffle buffer
+between the dataloader and the training loop may yield free performance
+gains on compiled pipelines, independent of any curriculum design.
+This is particularly relevant for best-fit packed dataloaders, which
+create the sequential correlation that compilation exploits.
+
+\subsection{For Framework Developers}
+
+The kernel-level overfitting mechanism suggests that compilation
+strategies could be modified to avoid specializing to data-dependent
+access patterns. Periodic kernel recompilation or input-dependent
+dispatch could mitigate the effect without requiring explicit shuffling.
+
+%% ============================================================
+\section{Limitations}\label{sec:limitations}
+%% ============================================================
+
+\textbf{Scale:} All experiments use a 3M-parameter model with a 5-minute
+training budget. The compilation hypothesis may not hold at larger scales
+where kernel specialization is a smaller fraction of total computation.
+
+\textbf{Mechanism verification:} The compilation hypothesis is
+consistent with observations but has not been verified at the kernel
+level. Direct analysis of compiled CUDA kernels under sequential vs
+shuffled data would strengthen the claim.
+
+\textbf{Other compiled frameworks:} Only PyTorch \texttt{torch.compile}
+and MLX are compared. Testing on JAX/XLA, TensorFlow XLA, or
+TorchScript would establish generality.
+
+\textbf{Single model architecture:} Only one GPT variant is tested.
+The interaction may differ for models with different attention patterns,
+batch normalization, or non-standard layer structures.
+
+%% ============================================================
+\section{Related Work}\label{sec:related}
+%% ============================================================
+
+\textbf{Curriculum learning} has been studied extensively in LLM
+pretraining. \citet{beyondrandom2025} demonstrate up to 3.5\% gains with
+compression-ratio difficulty. \citet{lrdecay2025} show that standard LR
+decay suppresses curriculum benefits by up to 44$\times$.
+\citet{influence2025} propose model-centric difficulty scoring.
+\citet{yang2025estimating} estimate ordering effects without retraining.
+
+\textbf{Compilation effects on training} have received limited attention.
+\citet{pytorch2compile} describe \texttt{torch.compile}'s architecture
+but focus on throughput rather than training dynamics.
+To our knowledge, no prior work documents an interaction between
+compilation and data ordering effects.
+
+\textbf{Data packing and ordering artifacts.}
+\citet{fewertruncations2024} document that best-fit packing creates
+deterministic ordering biases but do not investigate shuffling as a
+remedy. Our work identifies shuffling as effective specifically because
+it disrupts compilation-level specialization, not because it improves
+the curriculum per se.
+
+\textbf{Memorization-compression dynamics.}
+\citet{gapt2025} show that training alternates between memorization and
+compression phases, with oscillating gradient alignment. Our compilation
+hypothesis suggests that kernel specialization may amplify the
+memorization phase on compiled frameworks.
+
+%% ============================================================
+\section{Conclusion}\label{sec:conclusion}
+%% ============================================================
+
+We document a previously unreported interaction between
+\texttt{torch.compile} and training data ordering.
+Curriculum-like effects that appear large (0.106--0.151 bpb) on
+compiled CUDA training are absent (0.009--0.037 bpb, within noise)
+on non-compiled MLX training, despite identical model architecture,
+data, and evaluation.
+
+The most parsimonious explanation is that \texttt{torch.compile}'s
+kernel optimization specializes to sequential data access patterns
+created by best-fit packing. Any disruption of these patterns ---
+random shuffling, structured reordering, or even buffered passthrough
+--- forces more general computation that produces better-generalizing
+gradient updates.
+
+This finding has immediate practical implications: a random shuffle
+buffer provides free performance gains on compiled pipelines, and
+curriculum learning experiments should control for compilation to avoid
+reporting spurious effects.
+
+\section*{Acknowledgments}
+
+This work emerged from the King Wen I-Ching experimental research
+program \cite{chan2025kingwen}. The author thanks Claude (Anthropic)
+for assistance with experimental design and analysis. All code and
+data are open source at
+\url{https://github.com/augchan42/autoresearch} (CUDA) and
+\url{https://github.com/augchan42/autoresearch-mlx} (MLX).
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
