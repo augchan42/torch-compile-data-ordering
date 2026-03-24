@@ -85,16 +85,22 @@ something unexpected about how compilation interacts with data structure.
 \subsection{Model and Data}
 
 All experiments use the autoresearch framework \cite{karpathy2024autoresearch}:
-a 4-layer GPT model ($\sim$3M parameters) with sliding window attention,
-RoPE positional encoding, and a custom AdamW optimizer with per-parameter
-learning rate groups. Training data is drawn from ClimbMix-400B via
+a 4-layer GPT model ($\sim$3.4M parameters, $d_\text{model}=256$, 2 heads)
+with RoPE positional encoding, RMSNorm pre-normalization, value embeddings
+(ResFormer-style gating on alternating layers), and a ReGLU-squared MLP.
+Training uses a combined MuonAdamW optimizer with per-parameter learning
+rate groups (embedding 0.6, matrix 0.04, unembedding 0.004, scalar 0.5)
+and 50\% linear warmdown. Training data is drawn from ClimbMix-400B via
 parquet shards, tokenized with a BPE tokenizer (vocabulary size 8192)
 and packed using best-fit document packing \cite{fewertruncations2024}.
+Total batch size is $2^{17}$ tokens (device batch 16, sequence length 2048,
+gradient accumulation 4).
 
 Training is bounded by a fixed wall-clock budget of 300 seconds.
 Curriculum overhead (difficulty scoring, buffer sorting) counts against
 this budget, ensuring that expensive ordering strategies are
-automatically penalized.
+automatically penalized. On CUDA, both the model and optimizer step
+functions are compiled with \texttt{torch.compile(dynamic=False)}.
 
 \subsection{Curriculum Buffer}
 
@@ -143,8 +149,13 @@ are the framework (PyTorch vs MLX) and hardware (NVIDIA vs Apple Silicon).
 The primary metric is \textbf{val\_bpb} (validation bits per byte) ---
 a vocabulary-size-independent measure of language modeling quality.
 Lower is better. Evaluation uses $\sim$1.5M tokens from a held-out
-validation shard. The seed noise floor is 0.04 bpb, established by
-a 30-seed sweep (ADR-004 in supplementary materials).
+validation shard.
+
+The CUDA seed noise floor is established by a 30-seed sweep (seeds 0--29):
+mean val\_bpb = 1.756, std = 0.009, range = 0.041 (best 1.732, worst 1.773).
+We adopt $\pm$0.040 bpb as the CUDA noise floor.
+The MLX noise floor is 0.060 bpb (3-seed sweep: seeds 42, 7, 123;
+range at DEPTH=4).
 
 %% ============================================================
 \section{Results}\label{sec:results}
@@ -158,18 +169,19 @@ difficulty metrics.
 \begin{table}[h]
 \centering
 \caption{CUDA results: val\_bpb by ordering and difficulty metric.
-Seed 42, DEPTH=4, standard warmdown (0.5).}
+Seed 42, DEPTH=4, standard warmdown (0.5). Steps column shows
+optimizer steps completed within the 300s budget (token diversity runs).}
 \label{tab:cuda}
-\begin{tabular}{lcccc}
+\begin{tabular}{lccccc}
 \toprule
-Ordering & Token Div & Comp Ratio & $\Delta$ (TD) & $\Delta$ (CR) \\
+Ordering & Token Div & Comp Ratio & $\Delta$ (TD) & $\Delta$ (CR) & Steps \\
 \midrule
-Sequential       & 1.719 & 1.778 & ---    & ---    \\
-Buffered pass    & 1.680 & 1.640 & -0.039 & -0.138 \\
-\textbf{Random}  & \textbf{1.614} & \textbf{1.627} & \textbf{-0.106} & \textbf{-0.151} \\
-Easy-to-hard     & 1.632 & 1.634 & -0.087 & -0.144 \\
-Hard-to-easy     & 1.627 & 1.634 & -0.092 & -0.144 \\
-King Wen         & 1.662 & 1.638 & -0.057 & -0.140 \\
+Sequential       & 1.719 & 1.778 & ---    & ---    & 124 \\
+Buffered pass    & 1.680 & 1.640 & -0.039 & -0.138 & 86 \\
+\textbf{Random}  & \textbf{1.614} & \textbf{1.627} & \textbf{-0.106} & \textbf{-0.151} & 98 \\
+Easy-to-hard     & 1.632 & 1.634 & -0.087 & -0.144 & 95 \\
+Hard-to-easy     & 1.627 & 1.634 & -0.092 & -0.144 & 97 \\
+King Wen         & 1.662 & 1.638 & -0.057 & -0.140 & 89 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -178,6 +190,11 @@ All orderings beat sequential. Random shuffle is the best ordering
 under token diversity (0.106 improvement, 2.7$\times$ the noise floor).
 Under compression ratio, the spread collapses to 0.011 but all orderings
 still strongly beat sequential (0.138--0.151).
+
+Notably, buffered orderings complete 21--31\% fewer steps than sequential
+(86--98 vs 124) due to buffer overhead, yet still achieve substantially
+lower val\_bpb. The improvement comes from better-generalizing gradient
+updates, not more training.
 
 \subsection{MLX: Null Effects}
 
@@ -207,6 +224,33 @@ No ordering beats sequential by more than the 0.060 noise floor
 was also tested: sequential 1.663, random 1.673 --- random is
 actually \emph{worse}, confirming the null result.
 
+The null result holds at DEPTH=6 ($\sim$26M parameters).
+Table~\ref{tab:mlx6} shows MLX results at DEPTH=6 (noise floor 0.043).
+
+\begin{table}[h]
+\centering
+\caption{MLX results at DEPTH=6: val\_bpb by ordering and LR regime.
+Seed 42, compression ratio metric. Noise floor 0.043 (3-seed range).}
+\label{tab:mlx6}
+\begin{tabular}{lcc}
+\toprule
+Ordering & Standard WD & Constant LR \\
+\midrule
+Sequential       & 2.056 & 2.039 \\
+Random           & 2.047 & 2.056 \\
+Easy-to-hard     & 2.099 & 2.079 \\
+Hard-to-easy     & 2.084 & 2.095 \\
+King Wen         & 2.074 & 2.030 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+No ordering at DEPTH=6 exceeds the 0.043 noise floor either. At this
+depth, easy-to-hard and hard-to-easy actually \emph{hurt} relative to
+sequential under both LR regimes, while King Wen shows an interesting
+reversal (best ordering at DEPTH=6 with constant LR, $-0.009$ vs
+sequential) --- but still within noise.
+
 \subsection{Cross-Platform Comparison}
 
 \begin{table}[h]
@@ -230,6 +274,18 @@ The platform gap is 4--10$\times$ larger than the metric gap.
 CUDA shows 0.138--0.151 bpb improvement from any reordering.
 MLX shows 0.009--0.037 --- within seed noise.
 The effect is platform-dependent, not metric-dependent.
+
+\subsection{Adaptive Ordering Does Not Help Further}
+
+To test whether a more sophisticated ordering could extract additional
+benefit, we implemented a UCB1 bandit-based adaptive curriculum on CUDA.
+The buffer is partitioned into 8 difficulty buckets; the bandit tracks
+loss improvement per bucket and selects buckets via
+$\text{score} = \bar{r} + 1.414\sqrt{\ln(N)/n_k}$.
+The adaptive ordering achieved val\_bpb 1.863 vs random's 1.870 and
+sequential's 1.968 --- a 0.007 improvement over random, well within
+the $\pm$0.040 noise floor. The dominant effect remains buffering itself
+($\sim$0.1 bpb over sequential), not the ordering within the buffer.
 
 %% ============================================================
 \section{Analysis}\label{sec:analysis}
@@ -255,9 +311,55 @@ metrics.
 CUDA effects (0.106--0.151) are 2.5--3.8$\times$ their noise floor,
 while MLX effects (0.009--0.037) are 0.2--0.6$\times$.
 
+\textbf{Training steps:} Buffered orderings complete 21--31\% fewer
+optimizer steps than sequential (86--98 vs 124 on CUDA) due to buffer
+overhead, yet achieve better val\_bpb. If more steps were the explanation,
+sequential should win. Among buffered orderings, step count and val\_bpb
+are correlated ($r = -0.98$), but the step variance is small (86--98)
+and cannot explain the 0.106 bpb gap between sequential and random.
+
 \textbf{Data ordering:} Both platforms use the same dataloader, the
 same best-fit packing, and the same buffer implementation. The data
 is identically ordered on both machines.
+
+\subsection{Mechanistic Evidence: The Buffer Bug}
+
+An early implementation error provides direct evidence for the
+compilation hypothesis. In the first version of the curriculum buffer
+(v1), buffered batches were stored as cloned GPU tensors rather than
+CPU pinned memory. This changed the memory layout of tensors fed to
+the compiled model. The result was catastrophic:
+
+\begin{table}[h]
+\centering
+\caption{Buffer v1 bug: GPU tensor cloning breaks \texttt{torch.compile}.
+All non-sequential orderings produce $\sim$1 bpb degradation.}
+\label{tab:v1bug}
+\begin{tabular}{lcc}
+\toprule
+Ordering & val\_bpb & $\Delta$ vs Sequential \\
+\midrule
+Sequential (no buffer) & 1.719 & --- \\
+Buffered passthrough (v1) & 2.794 & +1.075 \\
+Random (v1) & 2.849 & +1.130 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The v1 passthrough mode used the same data order as sequential but
+yielded cloned GPU tensors instead of views of the original buffer.
+Its $+1.075$ bpb degradation --- identical in magnitude to the
+reordered conditions --- proves the problem was the tensor storage
+pattern, not the data ordering. The compiled model exhibited 15--20\%
+slower per-step execution, sawtooth loss patterns at buffer boundaries,
+and classic overfitting: training loss was much \emph{lower} (3.46 vs 5.90
+at step 31) but validation was 1 bpb worse.
+
+The v2 fix (CPU pinned memory buffer with a single reusable GPU tensor pair,
+preserving the original H2D transfer pattern) eliminated the pathology
+entirely and produced the results in Table~\ref{tab:cuda}. This confirms
+that \texttt{torch.compile}'s kernel optimization is sensitive to tensor
+memory layout and access patterns, not just data content.
 
 \subsection{The Compilation Hypothesis}
 
