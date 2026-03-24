@@ -191,6 +191,12 @@ under token diversity (0.106 improvement, 2.7$\times$ the noise floor).
 Under compression ratio, the spread collapses to 0.011 but all orderings
 still strongly beat sequential (0.138--0.151).
 
+\emph{Note on baselines:} The token diversity and compression ratio
+columns represent separate runs. The sequential baseline differs between
+metrics (1.719 vs 1.778) because compression ratio scoring adds gzip
+overhead that reduces step throughput. All $\Delta$ values are computed
+within a metric, not across metrics.
+
 Notably, buffered orderings complete 21--31\% fewer steps than sequential
 (86--98 vs 124) due to buffer overhead, yet still achieve substantially
 lower val\_bpb. The improvement comes from better-generalizing gradient
@@ -270,10 +276,21 @@ King Wen     & 1.638 & 1.724 & -0.140 & -0.009 \\
 \end{tabular}
 \end{table}
 
-The platform gap is 4--10$\times$ larger than the metric gap.
+The platform gap is 4--10$\times$ larger than the metric gap
+(Figure~\ref{fig:crossplatform}).
 CUDA shows 0.138--0.151 bpb improvement from any reordering.
 MLX shows 0.009--0.037 --- within seed noise.
 The effect is platform-dependent, not metric-dependent.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig1_cross_platform.pdf}
+\caption{Improvement over sequential baseline by ordering condition.
+CUDA effects (blue) are 4--10$\times$ larger than MLX (red) and far
+exceed their respective noise floors (dashed lines). All orderings
+use compression ratio as the difficulty metric.}
+\label{fig:crossplatform}
+\end{figure}
 
 \subsection{Adaptive Ordering Does Not Help Further}
 
@@ -293,34 +310,20 @@ the $\pm$0.040 noise floor. The dominant effect remains buffering itself
 
 \subsection{Ruling Out Confounds}
 
-Several alternative explanations are considered and ruled out:
-
-\textbf{Hardware differences:} The CUDA machine (RTX 2060, 6 GB) is
-weaker than the MLX machine (96 GB unified memory). If anything, the
-more powerful machine should show larger effects. It shows smaller ones.
-
-\textbf{Precision:} The CUDA machine trains in fp32 (Turing lacks bf16).
-The MLX machine also uses fp32. Precision is controlled.
-
-\textbf{Difficulty metric:} Both token diversity and compression ratio
-were tested on both platforms. The platform gap persists across both
-metrics.
-
-\textbf{Evaluation noise:} The MLX noise floor (0.060, measured via
-3-seed sweep) is larger than CUDA's (0.040, 30-seed sweep), but the
-CUDA effects (0.106--0.151) are 2.5--3.8$\times$ their noise floor,
-while MLX effects (0.009--0.037) are 0.2--0.6$\times$.
-
-\textbf{Training steps:} Buffered orderings complete 21--31\% fewer
-optimizer steps than sequential (86--98 vs 124 on CUDA) due to buffer
-overhead, yet achieve better val\_bpb. If more steps were the explanation,
-sequential should win. Among buffered orderings, step count and val\_bpb
-are correlated ($r = -0.98$), but the step variance is small (86--98)
-and cannot explain the 0.106 bpb gap between sequential and random.
-
-\textbf{Data ordering:} Both platforms use the same dataloader, the
-same best-fit packing, and the same buffer implementation. The data
-is identically ordered on both machines.
+\textbf{Hardware:} The CUDA machine (RTX 2060, 6 GB) is weaker than
+the MLX machine (96 GB unified). The more powerful machine shows
+\emph{smaller} effects.
+\textbf{Precision:} Both platforms train in fp32.
+\textbf{Difficulty metric:} The platform gap persists across both
+token diversity and compression ratio.
+\textbf{Evaluation noise:} CUDA effects (0.106--0.151) are
+2.5--3.8$\times$ the noise floor; MLX effects (0.009--0.037) are
+0.2--0.6$\times$.
+\textbf{Training steps:} Buffered orderings complete fewer steps
+(86--98 vs 124) yet achieve better val\_bpb; more training cannot
+explain the gap.
+\textbf{Data ordering:} Both platforms use the same dataloader,
+packing, and buffer implementation.
 
 \subsection{Mechanistic Evidence: The Buffer Bug}
 
@@ -357,110 +360,100 @@ at step 31) but validation was 1 bpb worse.
 
 The v2 fix (CPU pinned memory buffer with a single reusable GPU tensor pair,
 preserving the original H2D transfer pattern) eliminated the pathology
-entirely and produced the results in Table~\ref{tab:cuda}. This confirms
-that \texttt{torch.compile}'s kernel optimization is sensitive to tensor
-memory layout and access patterns, not just data content.
+entirely and produced the results in Table~\ref{tab:cuda}
+(Figure~\ref{fig:v1bug}). This confirms that \texttt{torch.compile}'s
+kernel optimization is sensitive to tensor memory layout and access
+patterns, not just data content.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig2_v1_bug.pdf}
+\caption{Buffer v1 bug: GPU tensor cloning degrades val\_bpb by
+$\sim$1 bpb regardless of ordering, while the v2 fix (CPU pinned
+memory) restores normal behavior. Same data, same ordering ---
+only the tensor storage pattern differs.}
+\label{fig:v1bug}
+\end{figure}
 
 \subsection{The Compilation Hypothesis}
 
 The remaining systematic difference is \texttt{torch.compile}.
-We propose that the compilation process creates the observed interaction:
+We propose a four-step mechanism:
+(1)~Best-fit packing creates implicit sequential correlation ---
+adjacent batches share similar document-length distributions
+\cite{fewertruncations2024}.
+(2)~\texttt{torch.compile} generates fused kernels optimized for
+observed access patterns; consistent sequential structure causes
+the kernels to specialize.
+(3)~This creates \emph{kernel-level overfitting}: the computation
+graph is locally optimal for the sequential pattern but suboptimal
+for the general distribution.
+(4)~Shuffling disrupts the pattern, forcing recompilation or
+fallback to more general execution paths that produce
+better-generalizing gradients.
 
-\begin{enumerate}
-\item Best-fit document packing creates implicit sequential correlation
-in the training data: adjacent batches share similar document-length
-distributions and content patterns \cite{fewertruncations2024}.
-
-\item \texttt{torch.compile} traces execution graphs and generates
-fused CUDA kernels optimized for the data access patterns it observes.
-When data has consistent sequential structure, the compiled kernels
-specialize to that structure.
-
-\item This specialization creates a form of \emph{kernel-level
-overfitting}: the compiled computation graph is locally optimal for the
-sequential data pattern but suboptimal for the general distribution.
-
-\item Shuffling the buffer disrupts the sequential pattern. The compiled
-kernels, now mismatched to the data, either recompile or fall back to
-more general execution paths. These general paths, while individually
-slower, produce better-generalizing gradient updates.
-\end{enumerate}
-
-On MLX, there is no compilation step. Operations execute eagerly via
-Metal compute shaders that do not adapt to data access patterns.
-Shuffling has no mechanism to disrupt because there is no
-pattern-adapted computation to disrupt.
+On MLX, operations execute eagerly via Metal compute shaders with
+no data-dependent specialization, so shuffling has no mechanism
+to improve.
 
 \subsection{Connection to Memorization-Compression Dynamics}
 
-Recent work on memorization-compression cycles \cite{gapt2025} has shown
-that LLM training naturally alternates between memorization
-(representation expansion) and compression (entropy reduction) phases.
-The gradient alignment between cross-entropy and representation entropy
-oscillates throughout training.
-
-The compilation hypothesis suggests a mechanism by which
-\texttt{torch.compile} may amplify the memorization phase. Compiled
-kernels that specialize to sequential patterns effectively ``memorize''
-the data structure at the computation level, reducing the implicit
-compression pressure that comes from processing diverse data.
-Shuffling restores this compression pressure by forcing the computation
-graph to handle unpredictable access patterns.
-
-This interpretation aligns with the observation that buffered passthrough
-alone (without scoring or reordering) provides substantial benefit on CUDA
-(0.039--0.138 bpb). The mere act of disrupting sequential access patterns
---- even without any curriculum logic --- accounts for most of the effect.
+\citet{gapt2025} show that LLM training alternates between memorization
+and compression phases. Our hypothesis suggests \texttt{torch.compile}
+amplifies memorization: compiled kernels ``memorize'' the sequential
+data structure at the computation level, reducing compression pressure.
+Shuffling restores this pressure. This interpretation explains why
+buffered passthrough alone (without curriculum logic) provides most
+of the benefit on CUDA (0.039--0.138 bpb) --- mere disruption of
+sequential access patterns suffices.
 
 %% ============================================================
 \section{Implications}\label{sec:implications}
 %% ============================================================
 
-\subsection{For Curriculum Learning Research}
-
-Any curriculum learning experiment conducted with \texttt{torch.compile}
-(or similar compilation frameworks such as JAX/XLA \cite{jax2018})
+\textbf{For curriculum learning research.}
+Experiments under \texttt{torch.compile} (or JAX/XLA \cite{jax2018})
 should include a non-compiled baseline to distinguish genuine curriculum
-effects from compilation artifacts. Studies reporting curriculum
-improvements without controlling for compilation may be measuring
-an interaction effect rather than a learning dynamics effect.
+effects from compilation artifacts.
 
-\subsection{For Training Infrastructure}
+\textbf{For training infrastructure.}
+A random shuffle buffer between the dataloader and training loop may
+yield free gains on compiled pipelines, especially with best-fit
+packed dataloaders.
 
-The finding that shuffling improves performance on compiled frameworks
-suggests a practical optimization: inserting a random shuffle buffer
-between the dataloader and the training loop may yield free performance
-gains on compiled pipelines, independent of any curriculum design.
-This is particularly relevant for best-fit packed dataloaders, which
-create the sequential correlation that compilation exploits.
-
-\subsection{For Framework Developers}
-
-The kernel-level overfitting mechanism suggests that compilation
-strategies could be modified to avoid specializing to data-dependent
-access patterns. Periodic kernel recompilation or input-dependent
-dispatch could mitigate the effect without requiring explicit shuffling.
+\textbf{For framework developers.}
+Compilation strategies could avoid specializing to data-dependent
+access patterns via periodic kernel recompilation or input-dependent
+dispatch.
 
 %% ============================================================
 \section{Limitations}\label{sec:limitations}
 %% ============================================================
 
-\textbf{Scale:} All experiments use a 3M-parameter model with a 5-minute
-training budget. The compilation hypothesis may not hold at larger scales
-where kernel specialization is a smaller fraction of total computation.
+\textbf{Single seed for curriculum comparisons.}
+The CUDA ordering results (Table~\ref{tab:cuda}) use seed 42 only.
+While the 30-seed baseline sweep establishes a noise floor of
+$\pm$0.040 bpb and the largest effects (0.106--0.151) exceed this by
+2.7--3.8$\times$, multi-seed validation of the curriculum comparisons
+themselves would strengthen confidence. The MLX null result is similarly
+single-seed, though the conclusion (no effect) is less sensitive to
+seed variance.
 
-\textbf{Mechanism verification:} The compilation hypothesis is
-consistent with observations but has not been verified at the kernel
-level. Direct analysis of compiled CUDA kernels under sequential vs
-shuffled data would strengthen the claim.
+\textbf{Scale.} All experiments use a 3.4M-parameter model with a
+5-minute training budget. The effect may diminish at larger scales where
+kernel specialization is a smaller fraction of total computation.
 
-\textbf{Other compiled frameworks:} Only PyTorch \texttt{torch.compile}
-and MLX are compared. Testing on JAX/XLA, TensorFlow XLA, or
-TorchScript would establish generality.
+\textbf{Mechanism verification.} The compilation hypothesis is
+consistent with observations (including the v1 buffer bug) but has not
+been verified via direct kernel analysis. Inspecting compiled CUDA
+graphs under sequential vs shuffled data would strengthen the claim.
 
-\textbf{Single model architecture:} Only one GPT variant is tested.
-The interaction may differ for models with different attention patterns,
-batch normalization, or non-standard layer structures.
+\textbf{Other compiled frameworks.} Only PyTorch \texttt{torch.compile}
+and MLX are compared. JAX/XLA and TensorFlow XLA would test generality.
+
+\textbf{Single architecture.} Only one GPT variant is tested.
+The interaction may differ for architectures with batch normalization
+or substantially different attention patterns.
 
 %% ============================================================
 \section{Related Work}\label{sec:related}
