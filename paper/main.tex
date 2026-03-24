@@ -7,11 +7,19 @@
 \usepackage{hyperref}
 \usepackage{fontspec}
 \usepackage{unicode-math}
-\setmainfont{Linux Libertine O}
-\setmathfont{XITS Math}
+\setmainfont{Linux Libertine}[
+  BoldFont = Linux Libertine Bold,
+  ItalicFont = Linux Libertine Italic,
+  BoldItalicFont = Linux Libertine Bold Italic,
+]
+\setmathfont{xits-math.otf}[
+  Path = ../xits-math/,
+  BoldFont = xits-mathbold.otf,
+]
 \usepackage{xcolor}
 \usepackage{booktabs}
 \usepackage{multirow}
+\usepackage{natbib}
 
 \title{Compiled Kernels Amplify Data Ordering Effects\\in Language Model Pretraining}
 \author{Augustin Chan\\
@@ -517,7 +525,7 @@ data are open source at
 \url{https://github.com/augchan42/autoresearch} (CUDA) and
 \url{https://github.com/augchan42/autoresearch-mlx} (MLX).
 
-\bibliographystyle{plain}
+\bibliographystyle{plainnat}
 \bibliography{references}
 
 \end{document}
